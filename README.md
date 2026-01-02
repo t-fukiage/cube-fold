@@ -14,3 +14,24 @@ A few resources to get you started if this is your first Flutter project:
 For help getting started with Flutter development, view the
 [online documentation](https://docs.flutter.dev/), which offers tutorials,
 samples, guidance on mobile development, and a full API reference.
+
+## Local Web Testing (GitHub Pages)
+
+This project is deployed to GitHub Pages under `/cube-fold/`. To test the same
+path locally, use the script below:
+
+```bash
+./scripts/serve_ghpages.sh
+# open http://localhost:8000/cube-fold/
+```
+
+Options:
+
+- Use a different port:
+  ```bash
+  ./scripts/serve_ghpages.sh 8001
+  ```
+- Override the base href:
+  ```bash
+  ./scripts/serve_ghpages.sh 8000 /cube-fold/
+  ```

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:vector_math/vector_math_64.dart' show Matrix4, Vector2, Vector3;
 
@@ -26,6 +27,8 @@ class _NetFoldPageState extends State<NetFoldPage> with TickerProviderStateMixin
   static const double _initialCameraAzimuth = math.pi / 3;
   static const double _initialCameraElevation = math.pi / 6;
   static const double _maxCameraElevation = math.pi / 2 - 0.01;
+  static const double _trackpadScrollZoomSensitivity = 0.002;
+  static const Duration _panZoomIdleResetDelay = Duration(milliseconds: 160);
 
   late final NetController _controller;
   NetRenderSnapshot? _latestSnapshot;
@@ -35,9 +38,14 @@ class _NetFoldPageState extends State<NetFoldPage> with TickerProviderStateMixin
   double _cameraElevation = _initialCameraElevation;
   double _cameraRadius = _defaultCameraRadius;
   Size? _lastFitSize;
+  bool _autoFitEnabled = true;
 
   int _pointerCount = 0;
   double _lastScale = 1.0;
+  bool _isTrackpadPanZoom = false;
+  bool _panZoomHasBaseline = false;
+  double _lastPanZoomScale = 1.0;
+  Timer? _panZoomIdleTimer;
   Offset? _lastPointerPosition;
   bool _isSingleFingerOrbit = false;
   Vector2? _dragPerpendicular;
@@ -77,6 +85,7 @@ class _NetFoldPageState extends State<NetFoldPage> with TickerProviderStateMixin
     }
     _snapController.dispose();
     _idleCheckTimer?.cancel();
+    _panZoomIdleTimer?.cancel();
     _celebrationController.dispose();
     super.dispose();
   }
@@ -115,23 +124,30 @@ class _NetFoldPageState extends State<NetFoldPage> with TickerProviderStateMixin
                         return SizedBox.expand(
                           child: Stack(
                             children: [
-                              GestureDetector(
+                              Listener(
                                 behavior: HitTestBehavior.opaque,
-                                onScaleStart: _handleScaleStart,
-                                onScaleUpdate: _handleScaleUpdate,
-                                onScaleEnd: _handleScaleEnd,
-                                child: CustomPaint(
-                                  painter: NetPainter(
-                                    controller: _controller,
-                                    camera: _camera,
-                                    selectedFaceId: _selectedFaceId,
-                                    grabbedEdgeIndex: _grabbedEdgeIndex,
-                                    showDragVector: false,
-                                    dragVectorStart: null,
-                                    dragVectorEnd: null,
-                                    onSnapshot: (snapshot) => _latestSnapshot = snapshot,
+                                onPointerPanZoomStart: _handlePointerPanZoomStart,
+                                onPointerPanZoomUpdate: _handlePointerPanZoomUpdate,
+                                onPointerPanZoomEnd: _handlePointerPanZoomEnd,
+                                onPointerSignal: _handlePointerSignal,
+                                child: GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onScaleStart: _handleScaleStart,
+                                  onScaleUpdate: _handleScaleUpdate,
+                                  onScaleEnd: _handleScaleEnd,
+                                  child: CustomPaint(
+                                    painter: NetPainter(
+                                      controller: _controller,
+                                      camera: _camera,
+                                      selectedFaceId: _selectedFaceId,
+                                      grabbedEdgeIndex: _grabbedEdgeIndex,
+                                      showDragVector: false,
+                                      dragVectorStart: null,
+                                      dragVectorEnd: null,
+                                      onSnapshot: (snapshot) => _latestSnapshot = snapshot,
+                                    ),
+                                    child: const SizedBox.expand(),
                                   ),
-                                  child: const SizedBox.expand(),
                                 ),
                               ),
                               Positioned.fill(
@@ -274,6 +290,7 @@ class _NetFoldPageState extends State<NetFoldPage> with TickerProviderStateMixin
   }
 
   void _handleScaleStart(ScaleStartDetails details) {
+    _resetPanZoomState();
     _pointerCount = details.pointerCount;
     _lastScale = 1.0;
     _idleCheckTimer?.cancel();
@@ -355,6 +372,84 @@ class _NetFoldPageState extends State<NetFoldPage> with TickerProviderStateMixin
     if (!startedSnap) {
       _checkCubeCompletion();
     }
+  }
+
+  void _handlePointerPanZoomStart(PointerPanZoomStartEvent event) {
+    _isTrackpadPanZoom = true;
+    _panZoomHasBaseline = true;
+    _lastPanZoomScale = 1.0;
+    _pointerCount = 0;
+    _idleCheckTimer?.cancel();
+    _isSingleFingerOrbit = false;
+    _cancelSnapListener();
+    _schedulePanZoomIdleReset();
+    if (_hasActiveFold) {
+      _clearActiveFold();
+    }
+  }
+
+  void _handlePointerPanZoomUpdate(PointerPanZoomUpdateEvent event) {
+    _schedulePanZoomIdleReset();
+    if (!_isTrackpadPanZoom) {
+      _isTrackpadPanZoom = true;
+      _panZoomHasBaseline = false;
+      _lastPanZoomScale = 1.0;
+    }
+    setState(() {
+      if (_hasActiveFold) {
+        _clearActiveFoldState();
+      }
+      if (!_panZoomHasBaseline) {
+        _lastPanZoomScale = event.scale;
+        _panZoomHasBaseline = true;
+        return;
+      }
+      final double deltaScale = event.scale / _lastPanZoomScale;
+      _applyZoomDelta(deltaScale);
+      _lastPanZoomScale = event.scale;
+    });
+  }
+
+  void _handlePointerPanZoomEnd(PointerPanZoomEndEvent event) {
+    _resetPanZoomState();
+  }
+
+  void _handlePointerSignal(PointerSignalEvent event) {
+    if (event is! PointerScrollEvent) return;
+    if (_isTrackpadPanZoom) return;
+    final double rawDelta = event.scrollDelta.dy == 0.0 ? event.scrollDelta.dx : event.scrollDelta.dy;
+    if (rawDelta == 0.0) return;
+    _pointerCount = 0;
+    _idleCheckTimer?.cancel();
+    _isSingleFingerOrbit = false;
+    _cancelSnapListener();
+    setState(() {
+      if (_hasActiveFold) {
+        _clearActiveFoldState();
+      }
+      final double scale = math.exp(-rawDelta * _trackpadScrollZoomSensitivity);
+      _applyZoomDelta(scale);
+    });
+    event.respond(allowPlatformDefault: false);
+  }
+
+  bool get _hasActiveFold =>
+      _activeFaceId != null ||
+      _activeAngleFaceId != null ||
+      _grabbedEdgeIndex != null ||
+      _selectedFaceId != null;
+
+  void _schedulePanZoomIdleReset() {
+    _panZoomIdleTimer?.cancel();
+    _panZoomIdleTimer = Timer(_panZoomIdleResetDelay, _resetPanZoomState);
+  }
+
+  void _resetPanZoomState() {
+    _panZoomIdleTimer?.cancel();
+    _panZoomIdleTimer = null;
+    _isTrackpadPanZoom = false;
+    _panZoomHasBaseline = false;
+    _lastPanZoomScale = 1.0;
   }
 
   void _beginFold(Offset focalPoint) {
@@ -618,7 +713,7 @@ class _NetFoldPageState extends State<NetFoldPage> with TickerProviderStateMixin
 
       final double scale = details.scale;
       final double deltaScale = scale / _lastScale;
-      _cameraRadius = (_cameraRadius / deltaScale).clamp(_minCameraRadius, _maxCameraRadius);
+      _applyZoomDelta(deltaScale);
       _lastScale = scale;
     });
   }
@@ -631,10 +726,19 @@ class _NetFoldPageState extends State<NetFoldPage> with TickerProviderStateMixin
   }
 
   void _applyOrbitDelta(Offset delta) {
+    _autoFitEnabled = false;
     _cameraAzimuth -= delta.dx * _orbitSensitivity;
     _cameraElevation += delta.dy * _orbitSensitivity;
     _cameraElevation = _cameraElevation.clamp(-_maxCameraElevation, _maxCameraElevation);
     _cameraAzimuth = _wrapAngle(_cameraAzimuth);
+  }
+
+  void _applyZoomDelta(double deltaScale) {
+    if (deltaScale == 1.0 || deltaScale.isNaN || deltaScale.isInfinite || deltaScale <= 0) {
+      return;
+    }
+    _autoFitEnabled = false;
+    _cameraRadius = (_cameraRadius / deltaScale).clamp(_minCameraRadius, _maxCameraRadius);
   }
 
   double _wrapAngle(double angle) {
@@ -660,6 +764,7 @@ class _NetFoldPageState extends State<NetFoldPage> with TickerProviderStateMixin
     if (size.isEmpty) return;
     if (_lastFitSize == size) return;
     _lastFitSize = size;
+    if (!_autoFitEnabled) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       final double fittedRadius = _computeFittedRadius(size);
@@ -777,6 +882,10 @@ class _NetFoldPageState extends State<NetFoldPage> with TickerProviderStateMixin
   }
 
   void _clearActiveFold() {
+    setState(_clearActiveFoldState);
+  }
+
+  void _clearActiveFoldState() {
     _activeFaceId = null;
     _activeAngleFaceId = null;
     _maxFoldAngle = null;
@@ -784,7 +893,6 @@ class _NetFoldPageState extends State<NetFoldPage> with TickerProviderStateMixin
     _lastPointerPosition = null;
     _grabbedEdgeIndex = null;
     _selectedFaceId = null;
-    setState(() {});
   }
 
   void _scheduleIdleCompletionCheck() {
