@@ -4,7 +4,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
-import 'package:vector_math/vector_math_64.dart' show Matrix4, Vector2, Vector3;
+import 'package:vector_math/vector_math_64.dart' show Matrix4, Quaternion, Vector2, Vector3;
 
 import '../net/net_controller.dart';
 import '../net/net_model.dart';
@@ -26,7 +26,6 @@ class _NetFoldPageState extends State<NetFoldPage> with TickerProviderStateMixin
   static const double _orbitSensitivity = 0.008;
   static const double _initialCameraAzimuth = math.pi / 3;
   static const double _initialCameraElevation = math.pi / 6;
-  static const double _maxCameraElevation = math.pi / 2 - 0.01;
   static const double _trackpadScrollZoomSensitivity = 0.002;
   static const Duration _panZoomIdleResetDelay = Duration(milliseconds: 160);
 
@@ -37,6 +36,7 @@ class _NetFoldPageState extends State<NetFoldPage> with TickerProviderStateMixin
   double _cameraAzimuth = _initialCameraAzimuth;
   double _cameraElevation = _initialCameraElevation;
   double _cameraRadius = _defaultCameraRadius;
+  Vector3 _cameraUp = Vector3(0, 1, 0);
   Size? _lastFitSize;
   bool _autoFitEnabled = true;
 
@@ -94,6 +94,7 @@ class _NetFoldPageState extends State<NetFoldPage> with TickerProviderStateMixin
         radius: _cameraRadius,
         azimuth: _cameraAzimuth,
         elevation: _cameraElevation,
+        up: _cameraUp,
         target: _controller.computeNetCentroid(),
       );
 
@@ -727,10 +728,82 @@ class _NetFoldPageState extends State<NetFoldPage> with TickerProviderStateMixin
 
   void _applyOrbitDelta(Offset delta) {
     _autoFitEnabled = false;
-    _cameraAzimuth -= delta.dx * _orbitSensitivity;
-    _cameraElevation += delta.dy * _orbitSensitivity;
-    _cameraElevation = _cameraElevation.clamp(-_maxCameraElevation, _maxCameraElevation);
-    _cameraAzimuth = _wrapAngle(_cameraAzimuth);
+    if (delta == Offset.zero) return;
+
+    final double yaw = delta.dx * _orbitSensitivity;
+    final double pitch = delta.dy * _orbitSensitivity;
+    if (yaw == 0.0 && pitch == 0.0) return;
+
+    final Vector3 target = _controller.computeNetCentroid();
+    final Vector3 position = _camera.position;
+    Vector3 offset = position - target;
+    if (offset.length2 < 1e-9) return;
+
+    Vector3 up = Vector3.copy(_cameraUp);
+    if (up.length2 < 1e-9) {
+      up = Vector3(0, 1, 0);
+    } else {
+      up.normalize();
+    }
+
+    Vector3 forward = (-offset).normalized();
+    up = _orthonormalizeUp(forward, up);
+    Vector3 right = forward.cross(up);
+    if (right.length2 < 1e-9) {
+      right = _fallbackRight(forward);
+    } else {
+      right.normalize();
+    }
+
+    if (yaw != 0.0) {
+      final Quaternion yawQ = Quaternion.axisAngle(up, yaw);
+      offset = yawQ.rotated(offset);
+      up = yawQ.rotated(up);
+    }
+
+    if (pitch != 0.0) {
+      forward = (-offset).normalized();
+      up = _orthonormalizeUp(forward, up);
+      right = forward.cross(up);
+      if (right.length2 < 1e-9) {
+        right = _fallbackRight(forward);
+      } else {
+        right.normalize();
+      }
+      final Quaternion pitchQ = Quaternion.axisAngle(right, pitch);
+      offset = pitchQ.rotated(offset);
+      up = pitchQ.rotated(up);
+    }
+
+    forward = (-offset).normalized();
+    up = _orthonormalizeUp(forward, up);
+
+    final double radius = offset.length;
+    if (radius < 1e-6) return;
+    _cameraRadius = radius.clamp(_minCameraRadius, _maxCameraRadius);
+    _cameraAzimuth = _wrapAngle(math.atan2(offset.x, offset.z));
+    _cameraElevation = math.asin((offset.y / radius).clamp(-1.0, 1.0));
+    _cameraUp = up;
+  }
+
+  Vector3 _orthonormalizeUp(Vector3 forward, Vector3 up) {
+    final double dot = forward.dot(up);
+    final Vector3 projected = Vector3.copy(up)..sub(forward * dot);
+    if (projected.length2 < 1e-9) {
+      final Vector3 fallback = forward.y.abs() < 0.9 ? Vector3(0, 1, 0) : Vector3(1, 0, 0);
+      projected.setFrom(forward.cross(fallback));
+    }
+    projected.normalize();
+    return projected;
+  }
+
+  Vector3 _fallbackRight(Vector3 forward) {
+    final Vector3 fallback = forward.y.abs() < 0.9 ? Vector3(0, 1, 0) : Vector3(1, 0, 0);
+    final Vector3 right = forward.cross(fallback);
+    if (right.length2 < 1e-9) {
+      return Vector3(1, 0, 0);
+    }
+    return right..normalize();
   }
 
   void _applyZoomDelta(double deltaScale) {

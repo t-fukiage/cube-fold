@@ -419,13 +419,16 @@ class OrbitCamera {
     required this.azimuth,
     required this.elevation,
     Vector3? target,
+    Vector3? up,
     this.fovY = math.pi / 3,
-  }) : target = target ?? Vector3.zero();
+  })  : target = target ?? Vector3.zero(),
+        up = up ?? Vector3(0, 1, 0);
 
   final double radius;
   final double azimuth;
   final double elevation;
   final Vector3 target;
+  final Vector3 up;
   final double fovY;
 
   Vector3 get position {
@@ -437,7 +440,6 @@ class OrbitCamera {
 
   Matrix4 viewMatrix() {
     final Vector3 eye = position;
-    final Vector3 up = Vector3(0, 1, 0);
     return makeViewMatrix(eye, target, up);
   }
 
